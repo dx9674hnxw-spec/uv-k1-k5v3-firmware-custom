@@ -9,7 +9,7 @@
  * On top: a mission chrono (SysTick), an APCO ten-code status, a call
  * journal, a roger beep (sent on air before unkeying), a TX time limit, a
  * night (inverted) display and a panic button: holding 0 for one second
- * transmits the emergency alert tone (911/1823 Hz alternating every 167 ms,
+ * transmits the emergency alert tone, also heard on the speaker (911/1823 Hz alternating every 167 ms,
  * 2 s bursts every 3.01 s, three bursts).
  *
  * Keys: PTT transmit · 1-7 status · MENU roger beep · F ops/journal ·
@@ -40,6 +40,7 @@
 #define REG_30_TX_LINK 0xC3FAu   /* BK4819_EnableTXLink                    */
 #define REG_30_IDLE    0xC1FEu   /* as BK4819_PlaySingleTone leaves it     */
 #define REG_70_TONE1   0xC200u   /* TONE1 on, tuning gain 66               */
+#define AF_BEEP        3u        /* BK4819_AF_BEEP: the TX tone on the speaker */
 
 enum { ST_IDLE, ST_RX, ST_TX, ST_PANIC };
 enum { LOG_RX, LOG_TX, LOG_PANIC };
@@ -148,11 +149,14 @@ static uint16_t toneReg(uint16_t hz) { return (uint16_t)(((uint32_t)hz * 1353245
  * while REG_71 is rewritten, so multi-tone patterns have no gaps or clicks. */
 static void tone(uint16_t hz, uint16_t ms) { A->bk_write(REG_71, toneReg(hz)); A->delay_ms(ms); }
 
-/* Keyed tone path (ToneCall's register sequence), left muted. */
-static void toneOn(void)
+/* Keyed tone path (ToneCall's register sequence), left muted. With local,
+ * the tone is also heard on the speaker, as BK4819_PlaySingleTone does for
+ * the resident roger beep with DTMF side tone on. */
+static void toneOn(bool local)
 {
     A->tx_mute(true);
-    A->set_af(APP_AF_MUTE);
+    A->set_af(local ? AF_BEEP : APP_AF_MUTE);
+    A->audio_path(local);
     A->bk_write(REG_70, REG_70_TONE1);
     A->bk_write(REG_30, REG_30_TX_LINK);
 }
@@ -160,13 +164,15 @@ static void toneOn(void)
 static void toneOff(void)
 {
     A->tx_mute(true);
+    A->audio_path(false);
+    A->set_af(APP_AF_MUTE);
     A->bk_write(REG_70, 0u);
     A->bk_write(REG_30, REG_30_IDLE);
 }
 
 static void rogerBeep(void)
 {
-    toneOn();
+    toneOn(false);
     A->bk_write(REG_71, toneReg(1000));
     A->tx_mute(false);
     switch (roger) {
@@ -198,7 +204,7 @@ static void panicStart(void)
     if (txDenied) return;
     rxListen(false);
     A->tx_set_params();
-    toneOn();
+    toneOn(true);           /* on air and on the speaker */
     state = ST_PANIC;
     panicT0 = A->ticks_ms();
     panicHz = 0;
