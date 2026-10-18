@@ -10,7 +10,7 @@
  * journal, a roger beep (sent on air before unkeying), a TX time limit, a
  * night (inverted) display and a panic button: holding 0 for one second
  * transmits the emergency alert tone, also heard on the speaker (911/1823 Hz alternating every 167 ms,
- * 2 s bursts every 3.01 s, three bursts).
+ * 2 s bursts every 3.01 s) until the user stops it.
  *
  * Keys: PTT transmit · 1-7 status · MENU roger beep · F ops/journal ·
  *       STAR night · 0 held 1 s panic (PTT or EXIT cancels) · EXIT quit.
@@ -31,7 +31,6 @@
 #define PANIC_STEP_MS  167u      /* each tone                              */
 #define PANIC_ON_MS    2004u     /* 12 tones per burst                     */
 #define PANIC_CYCLE_MS 3010u     /* burst + silence                        */
-#define PANIC_BURSTS   3u
 
 #define REG_0C         0x0Cu     /* bit 1: squelch open                    */
 #define REG_30         0x30u
@@ -224,9 +223,8 @@ static void panicStop(void)
 
 static void panicTick(void)
 {
-    const uint32_t el = A->ticks_ms() - panicT0;
-    if (el >= PANIC_CYCLE_MS * PANIC_BURSTS) { panicStop(); return; }
-    const uint32_t ph = el % PANIC_CYCLE_MS;
+    /* No end: only PTT or EXIT stops the alert. */
+    const uint32_t ph = (A->ticks_ms() - panicT0) % PANIC_CYCLE_MS;
     const uint16_t hz = ph >= PANIC_ON_MS ? 0u
                       : ((ph / PANIC_STEP_MS) & 1u) ? PANIC_HI_HZ : PANIC_LO_HZ;
     if (hz == panicHz) return;
@@ -318,9 +316,8 @@ static void drawOps(void)
 
     /* line 4: S-meter, the microphone scope while transmitting, or the alert */
     if (state == ST_PANIC) {
-        const uint32_t el = A->ticks_ms() - panicT0;
-        o = put(text, "ALERTE EMISE ");
-        *o++ = (char)('1' + el / PANIC_CYCLE_MS); o = put(o, "/3"); *o = '\0';
+        o = put(text, "ALERTE ");
+        o = putTime(o, live->dur); *o = '\0';
         A->print_normal(text, 0, 127, 4);
     } else if (state == ST_TX) {
         A->audio_scope(4u, true);
@@ -335,8 +332,10 @@ static void drawOps(void)
         }
     }
 
-    /* line 5: last call */
-    if (logCount) {
+    /* line 5: how to stop the alert, else the last call */
+    if (state == ST_PANIC) {
+        put(text, "PTT OU EXIT: ARRET")[0] = '\0';
+    } else if (logCount) {
         const log_t *e = logAt(0);
         static const char *const LAST[3] = { "DERNIER RX ", "DERNIER TX ", "URGENCE " };
         o = put(text, LAST[e->tx]);
