@@ -8,23 +8,30 @@
  *
  * On top: a mission chrono (SysTick), an APCO ten-code status, a call
  * journal, a roger beep (sent on air before unkeying), a TX time limit, a
- * night (inverted) display and US siren tones (wail, yelp, phaser). The
- * siren only plays on the speaker; it is never keyed.
+ * night (inverted) display and a panic button: holding 0 for one second
+ * transmits the emergency alert tone (911/1823 Hz alternating every 167 ms,
+ * 2 s bursts every 3.01 s, three bursts).
  *
  * Keys: PTT transmit · 1-7 status · MENU roger beep · F ops/journal ·
- *       STAR night · 0 siren (cycles, PTT or EXIT stops) · EXIT quit.
+ *       STAR night · 0 held 1 s panic (PTT or EXIT cancels) · EXIT quit.
  */
 #include <stdint.h>
 #include <stdbool.h>
 #include "../app_api.h"
 
 #define LOOP_MS        10u
-#define CFG_MAGIC      0x7Cu
+#define CFG_MAGIC      0x7Du
 #define LOG_LEN        6u
 #define STATUS_N       7u
 #define ROGER_N        5u
-#define SIREN_N        4u
 #define TX_LIMIT_S     120u      /* own TX time-out: the resident TOT is not exposed */
+#define PANIC_HOLD_MS  1000u     /* 0 held this long arms the panic        */
+#define PANIC_LO_HZ    911u      /* alert tones, measured from the reference */
+#define PANIC_HI_HZ    1823u     /*   recording (an octave apart)            */
+#define PANIC_STEP_MS  167u      /* each tone                              */
+#define PANIC_ON_MS    2004u     /* 12 tones per burst                     */
+#define PANIC_CYCLE_MS 3010u     /* burst + silence                        */
+#define PANIC_BURSTS   3u
 
 #define REG_0C         0x0Cu     /* bit 1: squelch open                    */
 #define REG_30         0x30u
@@ -33,15 +40,15 @@
 #define REG_30_TX_LINK 0xC3FAu   /* BK4819_EnableTXLink                    */
 #define REG_30_IDLE    0xC1FEu   /* as BK4819_PlaySingleTone leaves it     */
 #define REG_70_TONE1   0xC200u   /* TONE1 on, tuning gain 66               */
-#define REG_70_SIREN   0xE000u   /* TONE1 on, tuning gain 96 (loud beep)   */
 
-enum { ST_IDLE, ST_RX, ST_TX, ST_SIREN };
+enum { ST_IDLE, ST_RX, ST_TX, ST_PANIC };
+enum { LOG_RX, LOG_TX, LOG_PANIC };
 enum { ROGER_OFF, ROGER_BIP, ROGER_BIPBOP, ROGER_QUINDAR, ROGER_MDC };
 
 typedef struct {
     uint16_t at;     /* mission second the call started */
     uint16_t dur;    /* seconds                         */
-    uint8_t  tx;     /* own transmission                */
+    uint8_t  tx;     /* LOG_RX, LOG_TX or LOG_PANIC     */
     uint8_t  s;      /* peak S level (RX only)          */
 } log_t;
 
@@ -54,15 +61,16 @@ static const char *const STATUS[STATUS_N] = {
 static const char *const ROGER[ROGER_N] = {
     "ROGER OFF", "ROGER BIP", "ROGER BIP-BOP", "ROGER QUINDAR", "ROGER MDC"
 };
-static const char *const SIREN[SIREN_N] = { "", "SIRENE WAIL", "SIRENE YELP", "SIRENE PHASER" };
 
 static const app_api_t *A;
 static log_t journal[LOG_LEN];
 static log_t *live;               /* entry being timed, NULL when idle */
 static uint32_t t0;
 static uint16_t mission;
-static uint8_t logCount, logHead, state, status, roger, sNow, siren;
-static uint32_t sirenT0;
+static uint8_t logCount, logHead, state, status, roger, sNow;
+static uint32_t panicT0, holdT0;
+static uint16_t panicHz;          /* tone currently keyed, 0 = muted */
+static bool holding0;
 static bool running, night, journalView, txTimedOut;
 static uint8_t txDenied;          /* tx_state() code: 1 band/lock/mode, 2 battery low, 3 voltage high */
 static char text[28];             /* longest: a 20-glyph journal row + NUL */
@@ -97,7 +105,7 @@ static uint8_t sLevel(int16_t dbm)
 static void invertLine(uint8_t line) { for (uint8_t x = 0; x < 128u; x++) A->fb[line][x] ^= 0xFFu; }
 
 /* ---- call journal ---- */
-static void logOpen(bool tx)
+static void logOpen(uint8_t tx)
 {
     live = &journal[logHead];
     logHead = (uint8_t)((logHead + 1u) % LOG_LEN);
@@ -108,7 +116,7 @@ static void logOpen(bool tx)
 static const log_t *logAt(uint8_t age) { return &journal[(logHead + LOG_LEN - 1u - age) % LOG_LEN]; }
 
 /* ---- radio ---- */
-static void sirenStop(void);
+static void panicStop(void);
 
 static void rxListen(bool open)
 {
@@ -124,14 +132,13 @@ static void rxResume(void)
 
 static void txStart(void)
 {
-    sirenStop();
     txDenied = A->tx_state();
     if (txDenied) return;
     rxListen(false);
     A->tx_set_params();     /* carrier + PA + channel CTCSS/DCS, microphone open */
     state = ST_TX;
     txTimedOut = false;
-    logOpen(true);
+    logOpen(LOG_TX);
 }
 
 /* BK4819 REG_71 value for a tone in Hz (driver scale_freq, rounded). */
@@ -141,12 +148,25 @@ static uint16_t toneReg(uint16_t hz) { return (uint16_t)(((uint32_t)hz * 1353245
  * while REG_71 is rewritten, so multi-tone patterns have no gaps or clicks. */
 static void tone(uint16_t hz, uint16_t ms) { A->bk_write(REG_71, toneReg(hz)); A->delay_ms(ms); }
 
-static void rogerBeep(void)
+/* Keyed tone path (ToneCall's register sequence), left muted. */
+static void toneOn(void)
 {
     A->tx_mute(true);
     A->set_af(APP_AF_MUTE);
     A->bk_write(REG_70, REG_70_TONE1);
     A->bk_write(REG_30, REG_30_TX_LINK);
+}
+
+static void toneOff(void)
+{
+    A->tx_mute(true);
+    A->bk_write(REG_70, 0u);
+    A->bk_write(REG_30, REG_30_IDLE);
+}
+
+static void rogerBeep(void)
+{
+    toneOn();
     A->bk_write(REG_71, toneReg(1000));
     A->tx_mute(false);
     switch (roger) {
@@ -157,9 +177,7 @@ static void rogerBeep(void)
             for (uint8_t i = 0; i < 180u; i++) tone((A->rand32() & 1u) ? 1800u : 1200u, 1);
             break;
     }
-    A->tx_mute(true);
-    A->bk_write(REG_70, 0u);
-    A->bk_write(REG_30, REG_30_IDLE);
+    toneOff();
 }
 
 static void txStop(void)
@@ -173,50 +191,53 @@ static void txStop(void)
     rxResume();
 }
 
-/* US siren on the speaker only: the receiver is parked while it sounds. */
-static void sirenStop(void)
+/* ---- panic button: the emergency alert, keyed on the channel ---- */
+static void panicStart(void)
 {
-    if (state != ST_SIREN) return;
-    A->tx_mute(true);
-    A->audio_path(false);
-    A->tones_off_rx();
+    txDenied = A->tx_state();
+    if (txDenied) return;
+    rxListen(false);
+    A->tx_set_params();
+    toneOn();
+    state = ST_PANIC;
+    panicT0 = A->ticks_ms();
+    panicHz = 0;
+    logOpen(LOG_PANIC);
+    A->backlight_on();
+}
+
+static void panicStop(void)
+{
+    if (state != ST_PANIC) return;
+    toneOff();
+    A->tx_end();
     state = ST_IDLE;
-    siren = 0;
+    live = (void *)0;
     rxResume();
 }
 
-static void sirenNext(void)
+static void panicTick(void)
 {
-    const uint8_t next = (uint8_t)((siren + 1u) % SIREN_N);
-    sirenStop();
-    if (!next) return;
-    siren = next;
-    state = ST_SIREN;
-    sirenT0 = A->ticks_ms();
-    A->prepare_tone();                 /* AF beep path, TX DSP, tone muted */
-    A->bk_write(REG_70, REG_70_SIREN);
-    A->bk_write(REG_71, toneReg(700));
-    A->audio_path(true);
-    A->tx_mute(false);
-    A->led(true);
-}
-
-/* Sweep 700-1500 Hz: wail rises 2 s / falls 2 s, yelp rises in 1/3 s,
- * phaser in 1/10 s. */
-static void sirenTick(void)
-{
-    static const uint16_t PERIOD[SIREN_N] = { 1, 4000, 330, 100 };
-    const uint32_t period = PERIOD[siren];
-    uint32_t ph = (A->ticks_ms() - sirenT0) % period;
-    if (siren == 1u) ph = (ph < period / 2u) ? ph * 2u : (period - ph) * 2u; /* triangle */
-    A->bk_write(REG_71, toneReg((uint16_t)(700u + ph * 800u / period)));
+    const uint32_t el = A->ticks_ms() - panicT0;
+    if (el >= PANIC_CYCLE_MS * PANIC_BURSTS) { panicStop(); return; }
+    const uint32_t ph = el % PANIC_CYCLE_MS;
+    const uint16_t hz = ph >= PANIC_ON_MS ? 0u
+                      : ((ph / PANIC_STEP_MS) & 1u) ? PANIC_HI_HZ : PANIC_LO_HZ;
+    if (hz == panicHz) return;
+    if (hz) A->bk_write(REG_71, toneReg(hz));
+    if (!hz || !panicHz) A->tx_mute(!hz);   /* the silence keeps the carrier */
+    panicHz = hz;
 }
 
 /* One loop step: chrono, squelch, journal. */
 static void tick(void)
 {
     mission = (uint16_t)((A->ticks_ms() - t0) / 1000u);
-    if (state == ST_SIREN) { sirenTick(); return; }
+    if (state == ST_PANIC) {
+        panicTick();
+        if (live) live->dur = (uint16_t)(mission - live->at);
+        return;
+    }
     if (state == ST_TX) {
         live->dur = (uint16_t)(mission - live->at);
         if (live->dur >= TX_LIMIT_S) { txStop(); txTimedOut = true; }
@@ -263,9 +284,11 @@ static void drawOps(void)
     } else if (state == ST_RX) {
         A->print_bold("RECEPTION", 0, 127, 0);
         if (blink) invertLine(0);
-    } else if (state == ST_SIREN) {
-        A->print_bold(SIREN[siren], 0, 127, 0);
-        if (blink) invertLine(0);
+    } else if (state == ST_PANIC) {
+        A->print_bold("!! URGENCE !!", 0, 127, 0);
+        if (((A->ticks_ms() / 250u) & 1u) != 0u) invertLine(0);
+    } else if (holding0) {
+        A->print_normal("MAINTENIR 0...", 0, 127, 0);
     } else if (txDenied) {
         static const char *const WHY[3] = { "TX BLOQUE: BANDE", "BATTERIE FAIBLE", "TENSION HAUTE" };
         A->print_bold(WHY[(txDenied - 1u) % 3u], 0, 127, 0);
@@ -287,8 +310,13 @@ static void drawOps(void)
     uint8_t n = 0; while (r[n]) n++;
     A->print_tiny(r, (uint8_t)(127u - n * 4u), 25, false, true);   /* right-aligned */
 
-    /* line 4: S-meter, or the microphone scope while transmitting */
-    if (state == ST_TX) {
+    /* line 4: S-meter, the microphone scope while transmitting, or the alert */
+    if (state == ST_PANIC) {
+        const uint32_t el = A->ticks_ms() - panicT0;
+        o = put(text, "ALERTE EMISE ");
+        *o++ = (char)('1' + el / PANIC_CYCLE_MS); o = put(o, "/3"); *o = '\0';
+        A->print_normal(text, 0, 127, 4);
+    } else if (state == ST_TX) {
         A->audio_scope(4u, true);
     } else {
         A->audio_scope(4u, false);
@@ -304,7 +332,8 @@ static void drawOps(void)
     /* line 5: last call */
     if (logCount) {
         const log_t *e = logAt(0);
-        o = put(text, e->tx ? "DERNIER TX " : "DERNIER RX ");
+        static const char *const LAST[3] = { "DERNIER RX ", "DERNIER TX ", "URGENCE " };
+        o = put(text, LAST[e->tx]);
         o = putTime(o, e->at); *o = '\0';
     } else {
         put(text, "AUCUN APPEL")[0] = '\0';
@@ -325,7 +354,8 @@ static void drawJournal(void)
     for (uint8_t i = 0; i < logCount; i++) {
         const log_t *e = logAt(i);
         char *o = putTime(text, e->at);
-        o = put(o, e->tx ? "  TX   " : "  RX   ");
+        static const char *const DIR[3] = { "  RX   ", "  TX   ", "  SOS  " };
+        o = put(o, DIR[e->tx]);
         *o++ = e->tx ? '-' : (char)('0' + e->s);
         o = put(o, "   "); o = putTime(o, e->dur); *o = '\0';
         A->print_tiny(text, 2, (uint8_t)(9u + i * 8u), false, true);
@@ -352,8 +382,7 @@ static void key(uint8_t k)
         case APP_KEY_MENU: roger = (uint8_t)((roger + 1u) % ROGER_N); break;
         case APP_KEY_F:    journalView = !journalView; break;
         case APP_KEY_STAR: night = !night; break;
-        case APP_KEY_0:    if (state == ST_IDLE || state == ST_SIREN) sirenNext(); break;
-        case APP_KEY_EXIT: if (state == ST_SIREN) sirenStop(); else running = false; break;
+        case APP_KEY_EXIT: if (state == ST_PANIC) panicStop(); else running = false; break;
         default: break;
     }
 }
@@ -381,11 +410,19 @@ void app_main(const app_api_t *api)
         if (saver || k == APP_KEY_WAKE) k = APP_KEY_INVALID;
         if (k != APP_KEY_INVALID) A->backlight_on();
 
-        if (k == APP_KEY_PTT) {
-            if (prev != APP_KEY_PTT && state != ST_TX) txStart();
+        if (state == ST_PANIC && k == APP_KEY_PTT) {
+            if (prev != APP_KEY_PTT) panicStop();   /* PTT cancels; release+press to talk */
+        } else if (k == APP_KEY_PTT) {
+            if (prev != APP_KEY_PTT && state != ST_TX && prev == APP_KEY_INVALID) txStart();
         } else {
             if (prev == APP_KEY_PTT) { txStop(); txDenied = 0; }
             if (k != prev && k != APP_KEY_INVALID) key(k);
+        }
+        /* panic: 0 held PANIC_HOLD_MS from idle or receive */
+        holding0 = k == APP_KEY_0 && (state == ST_IDLE || state == ST_RX);
+        if (holding0) {
+            if (prev != APP_KEY_0) holdT0 = A->ticks_ms();
+            else if (A->ticks_ms() - holdT0 >= PANIC_HOLD_MS) { holding0 = false; panicStart(); }
         }
         prev = k;
 
@@ -395,10 +432,10 @@ void app_main(const app_api_t *api)
         const uint32_t now = A->ticks_ms();
         if ((!saver || state != ST_IDLE) && now - lastDraw >= 50u) { lastDraw = now; draw(); }
         if (state != ST_TX && now - lastBattery >= 1000u) { lastBattery = now; A->battery_sample(); }
-        A->delay_ms(state == ST_SIREN ? 2u : LOOP_MS); A->backlight_update();
+        A->delay_ms(LOOP_MS); A->backlight_update();
     }
 
-    sirenStop();
+    panicStop();
     txStop();
     rxListen(false);
     A->set_af(APP_AF_MUTE);
