@@ -63,7 +63,8 @@ static uint32_t t0;
 static uint16_t mission;
 static uint8_t logCount, logHead, state, status, roger, sNow, siren;
 static uint32_t sirenT0;
-static bool running, night, journalView, txDenied, txTimedOut;
+static bool running, night, journalView, txTimedOut;
+static uint8_t txDenied;          /* tx_state() code: 1 band/lock/mode, 2 battery low, 3 voltage high */
 static char text[28];             /* longest: a 20-glyph journal row + NUL */
 
 /* The Cortex-M0+ has no divider: route the compiler's helpers to the resident
@@ -124,7 +125,7 @@ static void rxResume(void)
 static void txStart(void)
 {
     sirenStop();
-    txDenied = A->tx_state() != 0;
+    txDenied = A->tx_state();
     if (txDenied) return;
     rxListen(false);
     A->tx_set_params();     /* carrier + PA + channel CTCSS/DCS, microphone open */
@@ -266,7 +267,8 @@ static void drawOps(void)
         A->print_bold(SIREN[siren], 0, 127, 0);
         if (blink) invertLine(0);
     } else if (txDenied) {
-        A->print_bold("TX REFUSE", 0, 127, 0);
+        static const char *const WHY[3] = { "TX BLOQUE: BANDE", "BATTERIE FAIBLE", "TENSION HAUTE" };
+        A->print_bold(WHY[(txDenied - 1u) % 3u], 0, 127, 0);
     } else if (txTimedOut) {
         A->print_bold("TX COUPE: 2 MIN", 0, 127, 0);
     } else {
@@ -278,9 +280,8 @@ static void drawOps(void)
     putFreq(text, rx);
     A->print_string(text, 0, 127, 1, 8);
 
-    /* line 3: TX frequency when split, end tone setting */
-    if (tx != rx) { o = put(text, "TX "); putFreq(o, tx); }
-    else put(text, "TX=RX")[0] = '\0';
+    /* line 3: frequency of the TX VFO (the one tx_state() checks), roger */
+    o = put(text, tx != rx ? "TX " : "TX="); putFreq(o, tx);
     A->print_tiny(text, 2, 25, false, true);
     const char *r = ROGER[roger];
     uint8_t n = 0; while (r[n]) n++;
@@ -383,7 +384,7 @@ void app_main(const app_api_t *api)
         if (k == APP_KEY_PTT) {
             if (prev != APP_KEY_PTT && state != ST_TX) txStart();
         } else {
-            if (prev == APP_KEY_PTT) { txStop(); txDenied = false; }
+            if (prev == APP_KEY_PTT) { txStop(); txDenied = 0; }
             if (k != prev && k != APP_KEY_INVALID) key(k);
         }
         prev = k;
