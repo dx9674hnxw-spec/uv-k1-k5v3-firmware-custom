@@ -59,7 +59,7 @@ static const char *const STATUS[STATUS_N] = {
     "10-7 HORS SERVICE", "10-19 RETOUR BASE", "CODE 4 RAS"
 };
 static const char *const ROGER[ROGER_N] = {
-    "ROGER OFF", "ROGER BIP", "ROGER BIP-BOP", "ROGER QUINDAR", "ROGER MDC"
+    "R:OFF", "R:BIP", "R:BIPBOP", "R:QUINDAR", "R:MDC"
 };
 
 static const app_api_t *A;
@@ -73,6 +73,7 @@ static uint16_t panicHz;          /* tone currently keyed, 0 = muted */
 static bool holding0;
 static bool running, night, journalView, txTimedOut;
 static uint8_t txDenied;          /* tx_state() code: 1 band/lock/mode, 2 battery low, 3 voltage high */
+static char name[11];             /* channel name, "" when unknown (VFO mode) */
 static char text[28];             /* longest: a 20-glyph journal row + NUL */
 
 /* The Cortex-M0+ has no divider: route the compiler's helpers to the resident
@@ -294,7 +295,7 @@ static void drawOps(void)
     } else if (holding0) {
         A->print_normal("MAINTENIR 0...", 0, 127, 0);
     } else if (txDenied) {
-        static const char *const WHY[3] = { "TX BLOQUE: BANDE", "BATTERIE FAIBLE", "TENSION HAUTE" };
+        static const char *const WHY[3] = { "TX BLOQUE", "BATT FAIBLE", "TENSION HAUTE" };
         A->print_bold(WHY[(txDenied - 1u) % 3u], 0, 127, 0);
     } else if (txTimedOut) {
         A->print_bold("TX COUPE: 2 MIN", 0, 127, 0);
@@ -302,13 +303,16 @@ static void drawOps(void)
         A->print_normal("VEILLE", 0, 127, 0);
     }
 
-    /* lines 1-2: RX frequency, big font */
+    /* lines 1-2: channel name in the big font, else the RX frequency */
     const uint32_t rx = A->rx_freq(), tx = A->tx_freq();
     putFreq(text, rx);
-    A->print_string(text, 0, 127, 1, 8);
+    A->print_string(name[0] ? name : text, 0, 127, 1, 8);
 
-    /* line 3: frequency of the TX VFO (the one tx_state() checks), roger */
-    o = put(text, tx != rx ? "TX " : "TX="); putFreq(o, tx);
+    /* line 3: RX frequency under a name, ">TX" when the TX VFO differs (the
+     * one tx_state() checks), roger on the right */
+    o = name[0] ? putFreq(text, rx) : text;
+    if (tx != rx) { o = put(o, name[0] ? ">" : "TX "); o = putFreq(o, tx); }
+    *o = '\0';
     A->print_tiny(text, 2, 25, false, true);
     const char *r = ROGER[roger];
     uint8_t n = 0; while (r[n]) n++;
@@ -355,7 +359,6 @@ static void drawJournal(void)
     /* Tiny font, columns aligned with the rows below. */
     A->print_tiny("HEURE  SENS S   DUREE", 2, 1, false, true);
     invertLine(0);
-    if (!logCount) { A->print_normal("JOURNAL VIDE", 0, 127, 3); return; }
     for (uint8_t i = 0; i < logCount; i++) {
         const log_t *e = logAt(i);
         char *o = putTime(text, e->at);
@@ -403,6 +406,19 @@ void app_main(const app_api_t *api)
     night  = valid && c[2] != 0u;
     roger  = (valid && c[3] < ROGER_N) ? c[3] : ROGER_MDC;
 
+    /* Channel name through the BEAM2 export of the TX VFO (a flash read that
+     * bypasses the overlay cache). Kept only when that VFO is the one being
+     * received; absent service or VFO mode: the frequency stays big. */
+    if (A->beam_get) {
+        app_beam_channel_t ch;
+        A->beam_get(&ch);
+        uint8_t n = 0;
+        if (ch.rx_frequency == A->rx_freq())
+            while (n < 10u && (uint8_t)(ch.name[n] - 0x20u) < 0x5Fu) { name[n] = ch.name[n]; n++; }
+        while (n && name[n - 1u] == ' ') n--;
+        name[n] = '\0';
+    }
+
     running = true; t0 = A->ticks_ms();
     A->backlight_on();
     rxResume();
@@ -445,6 +461,6 @@ void app_main(const app_api_t *api)
     rxListen(false);
     A->set_af(APP_AF_MUTE);
     const uint8_t n[4] = { CFG_MAGIC, status, night, roger };
-    if (n[0] != c[0] || n[1] != c[1] || n[2] != c[2] || n[3] != c[3])
-        A->cfg_save(n, 4);   /* flash written only on change */
+    for (uint8_t i = 0; i < 4u; i++)
+        if (n[i] != c[i]) { A->cfg_save(n, 4); break; }   /* flash written only on change */
 }
